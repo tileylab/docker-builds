@@ -1,0 +1,201 @@
+name: Build and Push Docker Images
+
+on: 
+  push:
+    branches: 
+      - main
+    paths: 
+      - 'builds/**'
+      - '. github/workflows/docker-build-push.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'builds/**'
+      - '.github/workflows/docker-build-push.yml'
+
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  # Job to detect which Dockerfiles changed (or all of them on main)
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs: 
+      matrix: ${{ steps. set-matrix.outputs.matrix }}
+      is_merged_pr: ${{ steps.check-merge.outputs.is_merged_pr }}
+    steps:
+      - name:  Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if this is a merged PR
+        id: check-merge
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]] && [[ "${{ github. ref }}" == "refs/heads/main" ]]; then
+            # Check if the push was from a merged PR
+            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
+            if [[ "$COMMIT_MESSAGE" =~ ^Merge\ pull\ request ]] || [[ -n "${{ github.event.pull_request.merged }}" ]]; then
+              echo "is_merged_pr=true" >> $GITHUB_OUTPUT
+              echo "✅ This push is from a merged pull request"
+            else
+              echo "is_merged_pr=true" >> $GITHUB_OUTPUT
+              echo "⚠️ This push to main will trigger DockerHub push (branch protection should prevent direct pushes)"
+            fi
+          else
+            echo "is_merged_pr=false" >> $GITHUB_OUTPUT
+            echo "📋 This is a pull request - will build and test only"
+          fi
+
+      - name:  Detect changed Dockerfiles
+        id: set-matrix
+        run:  |
+          # Find all directories with Dockerfiles in builds/
+          ALL_BUILDS=$(find builds -name "Dockerfile" -type f | sed 's|/Dockerfile||' | jq -R -s -c 'split("\n")[:-1] | map({name: split("/")[-1], path: .})')
+          
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, only build changed Dockerfiles
+            CHANGED_FILES=$(git diff --name-only origin/${{ github. base_ref }}... HEAD)
+            CHANGED_BUILDS=$(echo "$CHANGED_FILES" | grep "^builds/" | sed 's|/.*||' | sort -u | while read dir; do
+              if [ -n "$dir" ] && [ -f "$dir/Dockerfile" ]; then
+                echo "$dir"
+              fi
+            done | jq -R -s -c 'split("\n")[:-1] | map({name: split("/")[-1], path: .})')
+            
+            if [ "$CHANGED_BUILDS" == "[]" ] || [ -z "$CHANGED_BUILDS" ]; then
+              echo "No Dockerfile changes detected, building all"
+              echo "matrix=$ALL_BUILDS" >> $GITHUB_OUTPUT
+            else
+              echo "matrix=$CHANGED_BUILDS" >> $GITHUB_OUTPUT
+            fi
+          else
+            # For pushes to main (merged PRs), build all
+            echo "matrix=$ALL_BUILDS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Display build matrix
+        run: |
+          echo "Build matrix:"
+          echo '${{ steps.set-matrix.outputs.matrix }}'
+          echo ""
+          echo "Will push to DockerHub:  ${{ steps.check-merge. outputs.is_merged_pr }}"
+
+  # Job to build and test (always runs on PR and merged PR)
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.matrix != '[]'
+    runs-on:  ubuntu-latest
+    strategy: 
+      fail-fast: false
+      matrix: 
+        build:  ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build. name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=main-
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}. {{minor}}
+
+      - name:  Build Docker image for testing
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.build.path }}
+          file: ${{ matrix.build. path }}/Dockerfile
+          load: true
+          tags: ${{ matrix.build.name }}:test
+          cache-from: type=gha,scope=${{ matrix. build.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix. build.name }}
+
+      - name: Run tests in Docker container
+        run: |
+          echo "🧪 Running tests for ${{ matrix.build. name }}..."
+          docker run --rm ${{ matrix.build.name }}:test
+          echo "✅ Tests completed successfully for ${{ matrix.build.name }}!"
+
+      - name: Log in to DockerHub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with: 
+          username: ${{ secrets. DOCKERHUB_USERNAME }}
+          password: ${{ secrets. DOCKERHUB_TOKEN }}
+
+      - name: Build and push to DockerHub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.build.path }}
+          file: ${{ matrix.build.path }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.build.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}
+          platforms: linux/amd64,linux/arm64
+
+      - name: Summary
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "### 🔍 Pull Request Build Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **${{ matrix.build.name }}** - Build and tests passed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📦 Image will be pushed to DockerHub after PR is merged to main" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **${{ matrix.build.name }}** - Built, tested, and pushed to DockerHub" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🐳 **Pull command:**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build. name }}:latest" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Job to create a summary comment on PRs
+  pr-comment:
+    needs: [detect-changes, build-and-push]
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment on PR
+        uses:  actions/github-script@v7
+        with:
+          script:  |
+            const builds = ${{ needs.detect-changes.outputs.matrix }};
+            const buildNames = builds.map(b => b.name).join(', ');
+            
+            const comment = `## 🐳 Docker Build Status
+            
+            ✅ All Docker images built and tested successfully! 
+            
+            **Images tested:** ${buildNames}
+            
+            ### Next Steps
+            Once this PR is approved and merged to \`main\`, the following images will be pushed to DockerHub: 
+            ${builds.map(b => `- \`${{ secrets.DOCKERHUB_USERNAME }}/${b.name}:latest\``).join('\n')}
+            
+            ---
+            *Tests run automatically on every commit.  Images are only pushed after merge to main.*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue. number,
+              owner: context. repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
