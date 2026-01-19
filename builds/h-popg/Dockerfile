@@ -1,17 +1,17 @@
-# Use an official OpenJDK runtime as the base image
+# Use non-Alpine base image for multi-platform support
 FROM eclipse-temurin:11-jre
 
 # Set metadata labels
 LABEL maintainer="gptiley@ncsu.edu"
 LABEL description="Docker image for H-PoPG haplotyping application"
-LABEL version="v0.2.0"
+LABEL version="0.2.0"
 LABEL repository="https://github.com/MinzhuXie/H-PoPG"
 
-# Install git and wget for downloading the repository and health checks
-RUN apt-get add --no-cache git wget
+# Install git and wget for downloading the repository
+RUN apt-get update && apt-get install -y git wget && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user to run the application (security best practice)
-RUN groupadd -S appgroup && useradd -S appuser -G appgroup
+RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -45,11 +45,8 @@ RUN echo '#!/bin/bash' > /app/run-tests.sh && \
     echo 'echo ""' >> /app/run-tests.sh && \
     echo 'echo "=== All tests completed successfully ==="' >> /app/run-tests.sh && \
     echo 'echo "Output files created:"' >> /app/run-tests.sh && \
-    echo 'ls -lh /app/test_output_*.txt' >> /app/run-tests.sh && \
+    echo 'ls -lh /app/test_output_*. txt' >> /app/run-tests.sh && \
     chmod +x /app/run-tests.sh
 
 # Default command runs the tests
 CMD ["/app/run-tests.sh"]
-
-# Alternative:  To run the application interactively, override the CMD: 
-# docker run -it <image-name> java -jar /app/H-PoPGv0.2.0.jar -h
