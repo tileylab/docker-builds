@@ -1,5 +1,5 @@
 # Use an official OpenJDK runtime as the base image
-FROM eclipse-temurin:11-jre-alpine
+FROM eclipse-temurin:11-jre
 
 # Set metadata labels
 LABEL maintainer="gptiley@ncsu.edu"
@@ -8,10 +8,10 @@ LABEL version="v0.2.0"
 LABEL repository="https://github.com/MinzhuXie/H-PoPG"
 
 # Install git and wget for downloading the repository and health checks
-RUN apk add --no-cache git wget
+RUN apt-get add --no-cache git wget
 
 # Create a non-root user to run the application (security best practice)
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN groupadd -S appgroup && useradd -S appuser -G appgroup
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -34,7 +34,7 @@ USER appuser
 ENV JAVA_OPTS="-Xms256m -Xmx512m"
 
 # Create a test script to run the application with example data
-RUN echo '#!/bin/sh' > /app/run-tests.sh && \
+RUN echo '#!/bin/bash' > /app/run-tests.sh && \
     echo 'echo "=== Running H-PoP Test (without VCF) ==="' >> /app/run-tests.sh && \
     echo 'java $JAVA_OPTS -jar /app/H-PoPGv0.2.0.jar -p 3 -f /app/frags.txt -o /app/test_output_hpop.txt' >> /app/run-tests.sh && \
     echo 'if [ $? -eq 0 ]; then echo "H-PoP test PASSED"; else echo "H-PoP test FAILED"; exit 1; fi' >> /app/run-tests.sh && \
