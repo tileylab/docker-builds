@@ -45,7 +45,7 @@ RUN echo '#!/bin/bash' > /app/run-tests.sh && \
     echo 'echo ""' >> /app/run-tests.sh && \
     echo 'echo "=== All tests completed successfully ==="' >> /app/run-tests.sh && \
     echo 'echo "Output files created:"' >> /app/run-tests.sh && \
-    echo 'ls -lh /app/test_output_*. txt' >> /app/run-tests.sh && \
+    echo 'ls -lh /app/test_output_*.txt' >> /app/run-tests.sh && \
     chmod +x /app/run-tests.sh
 
 # Default command runs the tests
