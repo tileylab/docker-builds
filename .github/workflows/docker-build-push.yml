@@ -1,16 +1,16 @@
 name: Build and Push Docker Images
 
-on: 
+on:  
   push:
     branches: 
       - main
-    paths: 
+    paths:  
       - 'builds/**'
       - '. github/workflows/docker-build-push.yml'
   pull_request:
-    branches:
+    branches: 
       - main
-    paths:
+    paths: 
       - 'builds/**'
       - '.github/workflows/docker-build-push.yml'
 
@@ -21,28 +21,21 @@ jobs:
   # Job to detect which Dockerfiles changed (or all of them on main)
   detect-changes:
     runs-on: ubuntu-latest
-    outputs: 
-      matrix: ${{ steps. set-matrix.outputs.matrix }}
+    outputs:  
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
       is_merged_pr: ${{ steps.check-merge.outputs.is_merged_pr }}
     steps:
-      - name:  Checkout repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth:  0
 
       - name: Check if this is a merged PR
-        id: check-merge
+        id:  check-merge
         run: |
           if [[ "${{ github.event_name }}" == "push" ]] && [[ "${{ github. ref }}" == "refs/heads/main" ]]; then
-            # Check if the push was from a merged PR
-            COMMIT_MESSAGE=$(git log -1 --pretty=%B)
-            if [[ "$COMMIT_MESSAGE" =~ ^Merge\ pull\ request ]] || [[ -n "${{ github.event.pull_request.merged }}" ]]; then
-              echo "is_merged_pr=true" >> $GITHUB_OUTPUT
-              echo "✅ This push is from a merged pull request"
-            else
-              echo "is_merged_pr=true" >> $GITHUB_OUTPUT
-              echo "⚠️ This push to main will trigger DockerHub push (branch protection should prevent direct pushes)"
-            fi
+            echo "is_merged_pr=true" >> $GITHUB_OUTPUT
+            echo "✅ This is a push to main - will deploy to DockerHub"
           else
             echo "is_merged_pr=false" >> $GITHUB_OUTPUT
             echo "📋 This is a pull request - will build and test only"
@@ -50,27 +43,58 @@ jobs:
 
       - name:  Detect changed Dockerfiles
         id: set-matrix
-        run:  |
+        run: |
+          set -e  # Exit on error
+          
           # Find all directories with Dockerfiles in builds/
-          ALL_BUILDS=$(find builds -name "Dockerfile" -type f | sed 's|/Dockerfile||' | jq -R -s -c 'split("\n")[:-1] | map({name: split("/")[-1], path: .})')
+          if [ -d "builds" ]; then
+            ALL_BUILDS=$(find builds -name "Dockerfile" -type f 2>/dev/null | sed 's|/Dockerfile||' | jq -R -s -c 'split("\n")[:-1] | map(select(length > 0)) | map({name:  split("/")[-1], path: .})')
+          else
+            echo "No builds directory found"
+            ALL_BUILDS="[]"
+          fi
+          
+          echo "All builds found: $ALL_BUILDS"
           
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            # For PRs, only build changed Dockerfiles
-            CHANGED_FILES=$(git diff --name-only origin/${{ github. base_ref }}... HEAD)
-            CHANGED_BUILDS=$(echo "$CHANGED_FILES" | grep "^builds/" | sed 's|/.*||' | sort -u | while read dir; do
-              if [ -n "$dir" ] && [ -f "$dir/Dockerfile" ]; then
-                echo "$dir"
-              fi
-            done | jq -R -s -c 'split("\n")[:-1] | map({name: split("/")[-1], path: .})')
+            echo "Detecting changed files in PR..."
             
-            if [ "$CHANGED_BUILDS" == "[]" ] || [ -z "$CHANGED_BUILDS" ]; then
-              echo "No Dockerfile changes detected, building all"
-              echo "matrix=$ALL_BUILDS" >> $GITHUB_OUTPUT
+            # Fetch the base branch
+            git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }} || true
+            
+            # Get changed files
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}... HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+            
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            # Filter for builds directory changes
+            CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep "^builds/" | cut -d'/' -f1-2 | sort -u)
+            
+            echo "Changed build directories:"
+            echo "$CHANGED_DIRS"
+            
+            if [ -z "$CHANGED_DIRS" ]; then
+              echo "No changes in builds directory"
+              echo "matrix=[]" >> $GITHUB_OUTPUT
             else
-              echo "matrix=$CHANGED_BUILDS" >> $GITHUB_OUTPUT
+              # Build matrix for changed directories only
+              CHANGED_BUILDS=$(echo "$CHANGED_DIRS" | while read dir; do
+                if [ -n "$dir" ] && [ -f "$dir/Dockerfile" ]; then
+                  echo "$dir"
+                fi
+              done | jq -R -s -c 'split("\n")[:-1] | map(select(length > 0)) | map({name: split("/")[-1], path: .})')
+              
+              if [ "$CHANGED_BUILDS" == "[]" ] || [ -z "$CHANGED_BUILDS" ]; then
+                echo "No valid Dockerfile changes detected"
+                echo "matrix=[]" >> $GITHUB_OUTPUT
+              else
+                echo "matrix=$CHANGED_BUILDS" >> $GITHUB_OUTPUT
+              fi
             fi
           else
             # For pushes to main (merged PRs), build all
+            echo "Push to main - building all Docker images"
             echo "matrix=$ALL_BUILDS" >> $GITHUB_OUTPUT
           fi
 
@@ -84,15 +108,15 @@ jobs:
   # Job to build and test (always runs on PR and merged PR)
   build-and-push:
     needs: detect-changes
-    if: needs.detect-changes.outputs.matrix != '[]'
+    if: needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
     runs-on:  ubuntu-latest
-    strategy: 
+    strategy:  
       fail-fast: false
-      matrix: 
+      matrix:  
         build:  ${{ fromJson(needs.detect-changes.outputs.matrix) }}
     
     steps:
-      - name: Checkout repository
+      - name:  Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
@@ -102,49 +126,49 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build. name }}
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=main-
             type=ref,event=pr,prefix=pr-
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}. {{minor}}
+            type=semver,pattern={{major}}.{{minor}}
 
-      - name:  Build Docker image for testing
+      - name: Build Docker image for testing
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.build.path }}
           file: ${{ matrix.build. path }}/Dockerfile
           load: true
           tags: ${{ matrix.build.name }}:test
-          cache-from: type=gha,scope=${{ matrix. build.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix. build.name }}
+          cache-from: type=gha,scope=${{ matrix.build.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}
 
       - name: Run tests in Docker container
         run: |
           echo "🧪 Running tests for ${{ matrix.build. name }}..."
-          docker run --rm ${{ matrix.build.name }}:test
+          docker run --rm ${{ matrix.build.name }}: test
           echo "✅ Tests completed successfully for ${{ matrix.build.name }}!"
 
       - name: Log in to DockerHub
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
-        with: 
-          username: ${{ secrets. DOCKERHUB_USERNAME }}
+        with:  
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets. DOCKERHUB_TOKEN }}
 
       - name: Build and push to DockerHub
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.build.path }}
+        with: 
+          context: ${{ matrix. build.path }}
           file: ${{ matrix.build.path }}/Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps. meta.outputs.tags }}
+          labels: ${{ steps.meta. outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.build.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64, linux/arm64
 
       - name: Summary
         run: |
@@ -168,15 +192,15 @@ jobs:
   # Job to create a summary comment on PRs
   pr-comment:
     needs: [detect-changes, build-and-push]
-    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.matrix != '[]'
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes. outputs.matrix != ''
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
       - name: Comment on PR
-        uses:  actions/github-script@v7
+        uses: actions/github-script@v7
         with:
-          script:  |
+          script: |
             const builds = ${{ needs.detect-changes.outputs.matrix }};
             const buildNames = builds.map(b => b.name).join(', ');
             
@@ -187,15 +211,15 @@ jobs:
             **Images tested:** ${buildNames}
             
             ### Next Steps
-            Once this PR is approved and merged to \`main\`, the following images will be pushed to DockerHub: 
+            Once this PR is approved and merged to \`main\`, the following images will be pushed to DockerHub:
             ${builds.map(b => `- \`${{ secrets.DOCKERHUB_USERNAME }}/${b.name}:latest\``).join('\n')}
             
             ---
             *Tests run automatically on every commit.  Images are only pushed after merge to main.*`;
             
             github.rest.issues.createComment({
-              issue_number: context.issue. number,
-              owner: context. repo.owner,
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
               repo: context.repo.repo,
               body: comment
             });
