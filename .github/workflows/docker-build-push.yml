@@ -147,7 +147,7 @@ jobs:
       - name: Run tests in Docker container
         run: |
           echo "🧪 Running tests for ${{ matrix.build. name }}..."
-          docker run --rm ${{ matrix.build.name }}: test
+          docker run --rm ${{ matrix.build.name }}:test
           echo "✅ Tests completed successfully for ${{ matrix.build.name }}!"
 
       - name: Log in to DockerHub
