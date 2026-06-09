@@ -32,12 +32,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN echo "options(repos = c(CRAN = 'https://packagemanager.posit.co/cran/__linux__/noble/${PPM_SNAPSHOT}'))" \
         >> /usr/local/lib/R/etc/Rprofile.site
 
-# Install updog at a pinned version. remotes::install_version pulls from the
-# repos set above, so deps are also resolved against the snapshot.
-RUN R -e "install.packages('remotes')" && \
-    R -e "remotes::install_version('updog', version = '${UPDOG_VERSION}', \
-            upgrade = 'never', \
-            dependencies = c('Depends', 'Imports', 'LinkingTo'))" && \
+# Install updog. We use install.packages() rather than remotes::install_version()
+# on purpose: install_version always pulls source tarballs, which forces a
+# C++ compile of RcppArmadillo + updog. That's fine on amd64, but the CI
+# multi-arch build emulates arm64 via QEMU on an amd64 runner, where compiling
+# the Armadillo template code is slow enough to OOM the runner. install.packages
+# uses PPM's content negotiation to fetch arm64 binaries via the
+# HTTPUserAgent that rocker/r-ver already sets — no compile under emulation.
+#
+# Version pinning is preserved by the date-locked PPM snapshot (the snapshot
+# determines exactly which updog version is "current") plus the explicit
+# stopifnot check that fails the build if the installed version drifts.
+RUN R -e "install.packages('updog', dependencies = c('Depends', 'Imports', 'LinkingTo'))" && \
     R -e "stopifnot(packageVersion('updog') == '${UPDOG_VERSION}')"
 
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
