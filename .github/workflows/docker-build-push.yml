@@ -1,16 +1,16 @@
 name: Build and Push Docker Images
 
-on:  
+on:
   push:
-    branches: 
+    branches:
       - main
-    paths:  
+    paths:
       - 'builds/**'
-      - '. github/workflows/docker-build-push.yml'
+      - '.github/workflows/docker-build-push.yml'
   pull_request:
-    branches: 
+    branches:
       - main
-    paths: 
+    paths:
       - 'builds/**'
       - '.github/workflows/docker-build-push.yml'
 
@@ -21,7 +21,7 @@ jobs:
   # Job to detect which Dockerfiles changed (or all of them on main)
   detect-changes:
     runs-on: ubuntu-latest
-    outputs:  
+    outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       is_merged_pr: ${{ steps.check-merge.outputs.is_merged_pr }}
     steps:
@@ -45,7 +45,7 @@ jobs:
         id: set-matrix
         run: |
           set -e  # Exit on error
-          
+
           # Find all directories with Dockerfiles in builds/
           if [ -d "builds" ]; then
             ALL_BUILDS=$(find builds -name "Dockerfile" -type f 2>/dev/null | sed 's|/Dockerfile||' | jq -R -s -c 'split("\n")[:-1] | map(select(length > 0)) | map({name:  split("/")[-1], path: .})')
@@ -53,27 +53,27 @@ jobs:
             echo "No builds directory found"
             ALL_BUILDS="[]"
           fi
-          
+
           echo "All builds found: $ALL_BUILDS"
-          
+
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "Detecting changed files in PR..."
-            
+
             # Fetch the base branch
             git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }} || true
-            
+
             # Get changed files
             CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}... HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD)
-            
+
             echo "Changed files:"
             echo "$CHANGED_FILES"
-            
+
             # Filter for builds directory changes
             CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep "^builds/" | cut -d'/' -f1-2 | sort -u)
-            
+
             echo "Changed build directories:"
             echo "$CHANGED_DIRS"
-            
+
             if [ -z "$CHANGED_DIRS" ]; then
               echo "No changes in builds directory"
               echo "matrix=[]" >> $GITHUB_OUTPUT
@@ -84,7 +84,7 @@ jobs:
                   echo "$dir"
                 fi
               done | jq -R -s -c 'split("\n")[:-1] | map(select(length > 0)) | map({name: split("/")[-1], path: .})')
-              
+
               if [ "$CHANGED_BUILDS" == "[]" ] || [ -z "$CHANGED_BUILDS" ]; then
                 echo "No valid Dockerfile changes detected"
                 echo "matrix=[]" >> $GITHUB_OUTPUT
@@ -105,16 +105,17 @@ jobs:
           echo ""
           echo "Will push to DockerHub:  ${{ steps.check-merge. outputs.is_merged_pr }}"
 
-  # Job to build and test (always runs on PR and merged PR)
-  build-and-push:
+  # Job to build and test (always runs on PR and merged PR).
+  # Always amd64 + native — gates correctness before any push.
+  build-and-test:
     needs: detect-changes
     if: needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
-    runs-on:  ubuntu-latest
-    strategy:  
+    runs-on: ubuntu-latest
+    strategy:
       fail-fast: false
-      matrix:  
+      matrix:
         build:  ${{ fromJson(needs.detect-changes.outputs.matrix) }}
-    
+
     steps:
       - name:  Checkout repository
         uses: actions/checkout@v4
@@ -122,7 +123,79 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract metadata (tags, labels)
+      - name: Build Docker image for testing
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.build.path }}
+          file: ${{ matrix.build.path }}/Dockerfile
+          load: true
+          tags: ${{ matrix.build.name }}:test
+          # Scope matches the amd64 leg of push-by-digest so that the
+          # expensive build cache (R package installs, C++ compiles) carries
+          # over from test → push on the amd64 side. The arm64 push has its
+          # own cache scope and starts fresh per run (but native, not QEMU).
+          cache-from: type=gha,scope=${{ matrix.build.name }}-linux-amd64
+          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}-linux-amd64
+
+      - name: Run tests in Docker container
+        run: |
+          echo "🧪 Running tests for ${{ matrix.build.name }}..."
+          docker run --rm ${{ matrix.build.name }}:test
+          echo "✅ Tests completed successfully for ${{ matrix.build.name }}!"
+
+      - name: Summary
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "### 🔍 Pull Request Build Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **${{ matrix.build.name }}** - Build and tests passed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📦 Image will be pushed to DockerHub after PR is merged to main" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 🧪 Pre-push Test Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **${{ matrix.build.name }}** - Build and tests passed; proceeding to multi-arch push" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Job to build and push by digest, one matrix row per (build × arch).
+  # Each arch runs on its NATIVE runner — no QEMU. This is the canonical
+  # docker/build-push-action multi-platform pattern.
+  push-by-digest:
+    needs: [detect-changes, build-and-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+        platform:
+          - linux/amd64
+          - linux/arm64
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -134,64 +207,96 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build Docker image for testing
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.build.path }}
-          file: ${{ matrix.build. path }}/Dockerfile
-          load: true
-          tags: ${{ matrix.build.name }}:test
-          cache-from: type=gha,scope=${{ matrix.build.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}
+          file: ${{ matrix.build.path }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.build.name }}-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}-${{ env.PLATFORM_PAIR }}
 
-      - name: Run tests in Docker container
+      - name: Export digest
         run: |
-          echo "🧪 Running tests for ${{ matrix.build. name }}..."
-          docker run --rm ${{ matrix.build.name }}:test
-          echo "✅ Tests completed successfully for ${{ matrix.build.name }}!"
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.build.name }}-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Job to merge per-arch digests into one multi-arch manifest per image
+  # and push the tagged manifest list to DockerHub.
+  merge-manifest:
+    needs: [detect-changes, push-by-digest]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.build.name }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to DockerHub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
-        with:  
+        with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets. DOCKERHUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push to DockerHub
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: docker/build-push-action@v5
-        with: 
-          context: ${{ matrix. build.path }}
-          file: ${{ matrix.build.path }}/Dockerfile
-          push: true
-          tags: ${{ steps. meta.outputs.tags }}
-          labels: ${{ steps.meta. outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.build.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.build.name }}
-          platforms: linux/amd64, linux/arm64
+      - name: Extract metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=main-
+            type=ref,event=pr,prefix=pr-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }}:latest
 
       - name: Summary
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "### 🔍 Pull Request Build Summary" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **${{ matrix.build.name }}** - Build and tests passed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "📦 Image will be pushed to DockerHub after PR is merged to main" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **${{ matrix.build.name }}** - Built, tested, and pushed to DockerHub" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "🐳 **Pull command:**" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build. name }}:latest" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **${{ matrix.build.name }}** - Multi-arch image (amd64 + arm64) pushed to DockerHub" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🐳 **Pull command:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ matrix.build.name }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
   # Job to create a summary comment on PRs
   pr-comment:
-    needs: [detect-changes, build-and-push]
+    needs: [detect-changes, build-and-test]
     if: github.event_name == 'pull_request' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes. outputs.matrix != ''
     runs-on: ubuntu-latest
     permissions:
@@ -203,20 +308,20 @@ jobs:
           script: |
             const builds = ${{ needs.detect-changes.outputs.matrix }};
             const buildNames = builds.map(b => b.name).join(', ');
-            
+
             const comment = `## 🐳 Docker Build Status
-            
-            ✅ All Docker images built and tested successfully! 
-            
+
+            ✅ All Docker images built and tested successfully!
+
             **Images tested:** ${buildNames}
-            
+
             ### Next Steps
             Once this PR is approved and merged to \`main\`, the following images will be pushed to DockerHub:
             ${builds.map(b => `- \`${{ secrets.DOCKERHUB_USERNAME }}/${b.name}:latest\``).join('\n')}
-            
+
             ---
             *Tests run automatically on every commit.  Images are only pushed after merge to main.*`;
-            
+
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
