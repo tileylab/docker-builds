@@ -1,7 +1,7 @@
 # Multi-stage build: compile ebg from C++ source, then ship only the binary
 ARG EBG_REF=0068141dd83f7eef3c056194ef3b77e1f2f6c017
 
-FROM debian:bookworm-slim AS builder
+FROM ubuntu:jammy AS builder
 
 ARG EBG_REF
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ RUN git clone https://github.com/pblischak/polyploid-genotyping.git /tmp/src && 
     ./ebg -h 2>&1 | head -5 || true
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM ubuntu:jammy
 
 LABEL maintainer="gptiley@ncsu.edu"
 LABEL description="Docker image for EBG (empirical Bayesian genotyping) polyploid genotyper"
